@@ -1,0 +1,149 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "tboats"
+date: "Tuesday, June 16, 2015"
+output: html_document
+---
+
+### Executive Summary
+Data from personal activity tracking devices are analyzed and categorized based on many variables. The categorization is done through machine learning algorithms with the "caret" package in R. The goal is to predict the class of exercise subjects completed in the test data. A boosting method is used to train a model that performs with 96% accuracy, verified through repeated cross validation.
+
+### Data Cleaning
+The data can be downloaded from the following websites: [training set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv), [testing set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).  Once downloaded, the assumption is that the user of this markdown file places the data in their current working directory and does not change the name of the .csv files. The data are then loaded.
+
+
+```{r, echo=TRUE,cache=TRUE}
+### load the training and testing data
+training<-read.csv("pml-training.csv")
+testing<-read.csv("pml-testing.csv")
+```
+
+The data are not organized in a state that is easy for R to process in machine learning packages. To put the data sets in a proper state, several data columns are removed and the data are cleaned for processing. In step 1, columns mostly containing NA's are removed (the plot shows the number of NA's in each column; notice the somewhat binary relationship) as they do not contribute to any predictions.  In step 2, columns that have the class of "factor" are removed.  In step 3, logistical columns like username and timestamp are removed as they will not be useful in any machine learning technique.  In step 4, the coefficient of variation is computed to see if all the columns have a reasonable level of variation; if they do not vary, they should be removed.  All columns at this stage had more than 6% variation.
+
+```{r,echo=TRUE}
+# Step 1: find the columns that have many NA's and remove them
+numNA<-sapply(training,function(x) sum(is.na(x)))
+t<-numNA>(dim(training)[1]/2)
+plot(t,main="Fraction of data points that are NA")
+colNA<-names(training[,numNA>(dim(training)[1]/2)])
+trainingOI<-training[,!names(training) %in% colNA]
+
+# Step 2: check which columns are still factors
+trainClassCheck<-sapply(trainingOI,class)
+colFactor<-trainClassCheck=="factor"
+
+# assign any column with "DIV/0!" as a level to a "badCol"
+badCol<-c()
+for (i in names(trainingOI[,colFactor])){
+  if(sum(levels(trainingOI[,i])=="#DIV/0!")>0){
+    badCol<-c(badCol,i)
+  }
+}
+trainingOI<-trainingOI[,!names(trainingOI) %in% badCol]
+
+# Step 3: remove the columns with no information like username and time
+dropCols<-c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2","cvtd_timestamp","num_window")
+trainingOI<-trainingOI[,!names(trainingOI) %in% dropCols]
+trainingOI<-na.omit(trainingOI)
+
+# Step 4: check if any columns have no variation
+
+# change all int data types to numeric
+t<-trainingOI
+colClass<-sapply(t,class)
+
+for(i in names(colClass[colClass=="integer"])){
+  t[,i]<-as.numeric(t[,i])
+}
+t$new_window<-as.numeric(t$new_window)
+
+# check the variation and CoV
+sds<-apply(t[,names(t)!="classe"],2,sd)
+means<-colMeans(t[,names(t)!="classe"])
+covs<-sds/means
+plot(log(abs(covs)),main="Coefficient of Variation")
+```
+
+After cleaning, there are `r ncol(trainingOI)` columns that may be used in a machine learning technique.  The same column reductions are applied to the testing set.
+
+```{r, echo=TRUE}
+### Apply the same column exclusions to the testing data
+testingOI<-testing[,!names(testing) %in% c(badCol,colNA,dropCols)]
+```
+
+
+### Model Selection
+The "classe" variable encodes the type of exercise completed (for more information, see reference 1) in 5 different factors.  Since there are more than two classes, we are restricted to a subset of machine learning techniques.  Here, we will evaluate two different methods: classification trees with "rpart" and boosting with "gbm".
+
+In addition to the training and test sets, a validation set with 30% of the training set is segmented from the data.  This does not cause a problem as there are nearly 20,000 observations in the full training set, which is a large number compared to the number of exercise categories.
+
+```{r,echo=FALSE}
+library(caret)
+# set a seed
+set.seed(1010321)
+# partition some for validation
+invalidation<-createDataPartition(trainingOI$classe,p=0.3,list=FALSE)
+validation<-trainingOI[invalidation,]
+trainingSubset1<-trainingOI[-invalidation,]
+trainSubset<-trainingSubset1
+```
+
+#### Classification Tree
+The "rpart" package is used through caret to create a classification tree.  The "tuneLength" parameter tells the train function how many variables may be used in the training process.  The "trControl" parameter controls the cross validation technique. Cross-validation is useful for determining the out of sample error.  Here, the "repeatedcv" method is used, using a k-fold=3 with 5 repeats.  This splits the data up into 3 parts and runs the algorithm on each set for 5 repeats.  Through this process, the model accuracy is gauged.
+
+```{r,echo=TRUE,cache=TRUE}
+trControl<-trainControl(method="repeatedcv",number=3,repeats=5)
+modelFit<-train(classe~.,data=trainingSubset1,method="rpart",trControl=trControl,tuneLength=16)
+```
+
+Now, looking at the fitted model and the confusion matrix, we see that the accuracy is about 75%.  The out of sample error is likely about 1 - 0.75 = 0.25 = 25%.  The uncertainty in both estimates is related to the standard deviation of the accuracy, as computed by the repeats in the k-fold method of training (see below).
+
+```{r,echo=TRUE}
+# look at the classification tree
+library(rattle)
+fancyRpartPlot(modelFit$finalModel)
+```
+
+```{r,echo=FALSE}
+pred<-predict(modelFit,trainingSubset1) # predicted values
+```
+```{r,echo=TRUE}
+### check the confusion matrix of the training set
+print(modelFit)
+table(pred,trainingSubset1$classe)
+```
+
+#### Boosting
+Another method, which tends to be more accurate, is boosting.  This method is accessed through the "gbm" package.  This package allows for training with multi-categorical responses, unlike "ada" and "gamboost".  Again, the training data are broken up into 3 groups via the k-fold method (3-fold) through the trainControl function.
+
+```{r,echo=TRUE,cache=TRUE}
+trControl<-trainControl(method="repeatedcv",number=3,repeats=5)
+modelFit<-train(classe~.,data=trainSubset,method="gbm",verbose=FALSE,trControl=trControl)
+```
+
+```{r,echo=TRUE}
+### check the confusion matrix of the training set
+print(modelFit)
+pred<-predict(modelFit,trainSubset)
+print("Training Confusion Matrix")
+table(pred,trainSubset$classe)
+### Apply the validation set
+pred<-predict(modelFit,validation)
+print("Validation Confusion Matrix")
+table(pred,validation$classe)
+```
+
+The boosting results seem to be far superior to the classification tree results.  The accuracy is estimated to be 96% via the repeated cross validation technique. The standard deviation of this accuracy is 0.2%.  The out of sample error is then 1-0.96 = 0.04 = 4%.  This is confirmed (it is redundant, but instructive) on the validation data set as the confusion matrix shows similar ratios of correctly predicted classifications.
+
+Applying the boosting method to the test set, we arrive at the following classifications:
+
+```{r,echo=FALSE}
+pred<-predict(modelFit,testingOI)
+print(pred)
+```
+
+### Summary
+A boosting model has been shown to have superior predictive performance compared to classification trees. Cross validation was used to estimate the accuracy of the method (~96%).  An additional cross validation data set was used to check the predictive powers of the model.  The predictive model was used to classify a testing set of 20 data points with unknown classification.
+
+### References
+1. http://groupware.les.inf.puc-rio.br/har (Source of raw data)
